@@ -998,7 +998,36 @@ def _root_depth(side, legal, depth, prev_best, root_nocap):
     return best_sc, None, False
 
 
-def search_root(side, max_depth, time_limit, root_nocap):
+def _branch_factor(npieces, nlegal, prev_dur, older_dur):
+    """Guess how much slower the next ply will be.
+
+    The guess is deliberately under the raw branching of a full board, so
+    0.85s finishes depth 4 and still spends the rest of the budget on depth 5.
+    Fewer pieces, and a narrower root, grow slower, so the guess drops and
+    the same budget is allowed to start (and often finish) extra plies.
+    """
+    if npieces >= 28:
+        guess = 2.15
+    elif npieces >= 20:
+        guess = 2.1
+    elif npieces >= 14:
+        guess = 1.95
+    elif npieces >= 8:
+        guess = 1.7
+    else:
+        guess = 1.3
+    if nlegal <= 6:
+        guess = min(guess, 1.55)
+    elif nlegal <= 12:
+        guess = min(guess, 1.8)
+    if older_dur >= 0.01 and prev_dur > 0:
+        observed = prev_dur / older_dur
+        if 1.2 <= observed < guess:
+            guess = max(1.35, observed * 0.95)
+    return guess
+
+
+def search_root(side, max_depth, time_limit, root_nocap, npieces=32):
     global ABORT, DEADLINE, NODES, LAST, PATH
     PATH.clear()
     ksq = KR[side >> 3]
@@ -1015,7 +1044,8 @@ def search_root(side, max_depth, time_limit, root_nocap):
         if cap and (cap & 7) == K:
             LAST = (0, 1, MATE, 0.0)
             return mv
-    if len(legal) == 1 or max_depth == 0:
+    nlegal = len(legal)
+    if nlegal == 1 or max_depth == 0:
         LAST = (0, 1, 0, 0.0)
         return legal[0]
 
@@ -1027,14 +1057,18 @@ def search_root(side, max_depth, time_limit, root_nocap):
     depth_done = 0
     t0 = time.perf_counter()
     prev_dur = 0.0
+    older_dur = 0.0
     limit = max_depth if max_depth else 32
     d = 1
     while d <= limit:
-        if d > 1 and time.perf_counter() + prev_dur * 2.4 > DEADLINE:
-            break
+        if d > 1:
+            factor = _branch_factor(npieces, nlegal, prev_dur, older_dur)
+            if time.perf_counter() + prev_dur * factor > DEADLINE:
+                break
         ABORT = False
         st = time.perf_counter()
         sc, mv, done = _root_depth(side, legal, d, best, root_nocap)
+        older_dur = prev_dur
         prev_dur = time.perf_counter() - st
         if mv is not None:
             best = mv
@@ -1072,7 +1106,7 @@ def think(pieces, turn, mem, weights, depth=None, time_limit=None):
     h = HASH
     GH[h] = GH.get(h, 0) + 1
     limit = TIME_BUDGET if time_limit is None else time_limit
-    mv = search_root(side, depth, limit, root_nocap)
+    mv = search_root(side, depth, limit, root_nocap, n)
     if mv is None:
         mem.snapshot = None
         mem.last_n = n
