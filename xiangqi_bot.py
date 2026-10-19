@@ -19,6 +19,7 @@ MATE_TH = 20000
 INF = 10 ** 9
 TIME_BUDGET = 0.85
 DRAW_PLIES = 200  # 100 rounds without a capture
+CHOU_SETUP = 18  # battery that can uncover a check (抽将)
 
 SQX = [i % 9 for i in range(90)]
 SQY = [i // 9 for i in range(90)]
@@ -605,6 +606,293 @@ def gen_legal(side):
     return legal
 
 
+def _step(a, b):
+    """Step from a toward b, or 0 when the two squares are not on a line."""
+    if a % 9 == b % 9:
+        return 9 if b > a else -9
+    if a // 9 == b // 9:
+        return 1 if b > a else -1
+    return 0
+
+
+def _screen_count(a, b):
+    step = _step(a, b)
+    if not step:
+        return -1
+    n = 0
+    board = BOARD
+    s = a + step
+    while s != b:
+        if board[s]:
+            n += 1
+        s += step
+    return n
+
+
+def _piece_attacks(fr, to, piece):
+    """Does `piece` on fr attack to? Palace and blocking rules included."""
+    if fr == to or not piece:
+        return False
+    t = piece & 7
+    board = BOARD
+    if t == R:
+        return _screen_count(fr, to) == 0
+    if t == C:
+        return _screen_count(fr, to) == 1
+    if t == H:
+        for tsq, leg in HORSE_TO[fr]:
+            if tsq == to:
+                return board[leg] == 0
+        return False
+    fx = fr % 9
+    fy = fr // 9
+    tx = to % 9
+    ty = to // 9
+    if t == P:
+        if piece & 8:
+            if tx == fx and ty == fy + 1:
+                return True
+            return fy >= 5 and ty == fy and abs(tx - fx) == 1
+        if tx == fx and ty == fy - 1:
+            return True
+        return fy <= 4 and ty == fy and abs(tx - fx) == 1
+    if t == K:
+        if abs(fx - tx) + abs(fy - ty) != 1 or not (3 <= tx <= 5):
+            return False
+        return ty <= 2 if piece & 8 else ty >= 7
+    if t == A:
+        if abs(fx - tx) != 1 or abs(fy - ty) != 1 or not (3 <= tx <= 5):
+            return False
+        return ty <= 2 if piece & 8 else ty >= 7
+    if t == E:
+        if abs(fx - tx) != 2 or abs(fy - ty) != 2:
+            return False
+        if piece & 8:
+            if fy > 4 or ty > 4:
+                return False
+        elif fy < 5 or ty < 5:
+            return False
+        return board[((fy + ty) // 2) * 9 + (fx + tx) // 2] == 0
+    return False
+
+
+def _least_attacker(sq, side):
+    """Value of the cheapest piece of `side` that attacks sq. King counts as 1."""
+    best = None
+    board = BOARD
+    for fr in PL[side >> 3]:
+        p = board[fr]
+        if not p or (p & 8) != side:
+            continue
+        if _piece_attacks(fr, sq, p):
+            v = VAL[p & 7] or 1
+            if best is None or v < best:
+                best = v
+    return best
+
+
+def see_gain(mv):
+    """Material left after the capture and one recapture.
+
+    Positive means the capturer is not losing the exchange. A negative value
+    means the piece that just captured is eaten back for a loss.
+    """
+    cap = mv >> 14
+    if not cap:
+        return 0
+    if (cap & 7) == K:
+        return MATE
+    fr = mv & 127
+    to = (mv >> 7) & 127
+    board = BOARD
+    moving = board[fr]
+    if not moving:
+        return 0
+    side = moving & 8
+    victim = VAL[cap & 7]
+    attacker = VAL[moving & 7] or 1
+    board[fr] = 0
+    board[to] = moving
+    back = _least_attacker(to, side ^ 8)
+    if back is None:
+        board[fr] = moving
+        board[to] = cap
+        return victim
+    defend = _least_attacker(to, side)
+    board[fr] = moving
+    board[to] = cap
+    if defend is None:
+        return victim - attacker
+    return victim - attacker + back
+
+
+def _discover_squares(side):
+    """Squares our pieces stand on where leaving reveals a check."""
+    ksq = KR[(side ^ 8) >> 3]
+    if ksq < 0:
+        return ()
+    board = BOARD
+    found = []
+    seen = set()
+    for sq in PL[side >> 3]:
+        p = board[sq]
+        if not p or (p & 8) != side:
+            continue
+        t = p & 7
+        if t != R and t != C:
+            continue
+        step = _step(sq, ksq)
+        if not step:
+            continue
+        occ = 0
+        first = second = -1
+        s = sq + step
+        while s != ksq:
+            if board[s]:
+                occ += 1
+                if occ == 1:
+                    first = s
+                elif occ == 2:
+                    second = s
+                else:
+                    break
+            s += step
+        if t == R and occ == 1 and (board[first] & 8) == side and first not in seen:
+            seen.add(first)
+            found.append(first)
+        elif t == C and occ == 2:
+            for s in (first, second):
+                if board[s] and (board[s] & 8) == side and s not in seen:
+                    seen.add(s)
+                    found.append(s)
+    ht = side + H
+    for hsq, leg in HORSE_FROM[ksq]:
+        if board[hsq] == ht and board[leg] and (board[leg] & 8) == side and leg not in seen:
+            seen.add(leg)
+            found.append(leg)
+    return found
+
+
+def _opens_check(fr, to, side, ksq):
+    """True when moving fr -> to uncovers a rook, cannon, or horse check."""
+    board = BOARD
+    for sq in PL[side >> 3]:
+        if sq == fr:
+            continue
+        p = board[sq]
+        if not p or (p & 8) != side:
+            continue
+        t = p & 7
+        if t == R or t == C:
+            step = _step(sq, ksq)
+            if not step:
+                continue
+            occ = 0
+            on_line = False
+            landed = False
+            s = sq + step
+            while s != ksq:
+                if s == fr:
+                    on_line = True
+                if s == to:
+                    landed = True
+                if board[s]:
+                    occ += 1
+                    if occ > 2:
+                        break
+                s += step
+            if not on_line or landed:
+                continue
+            if t == R and occ == 1:
+                return True
+            if t == C and occ == 2:
+                return True
+        elif t == H:
+            for hsq, leg in HORSE_FROM[ksq]:
+                if hsq == sq and leg == fr and to != fr:
+                    return True
+    return False
+
+
+def _chou_target(mv, side, blockers):
+    """Value of the enemy piece won by a 抽将, or 0.
+
+    抽将: one piece steps off a line and uncovers check, while that same piece
+    captures or attacks a different enemy piece. The opponent has to answer
+    the check, so the attacked piece is the one we are trying to win.
+    """
+    fr = mv & 127
+    if fr not in blockers:
+        return 0
+    ksq = KR[(side ^ 8) >> 3]
+    if ksq < 0:
+        return 0
+    to = (mv >> 7) & 127
+    if not _opens_check(fr, to, side, ksq):
+        return 0
+    cap = mv >> 14
+    board = BOARD
+    moving = board[fr]
+    best = 0
+    if cap and (cap & 7) != K:
+        best = VAL[cap & 7]
+    board[fr] = 0
+    board[to] = moving
+    opp = side ^ 8
+    for sq in PL[opp >> 3]:
+        if sq == to:
+            continue
+        p = board[sq]
+        if not p or (p & 8) != opp or (p & 7) == K:
+            continue
+        if _piece_attacks(to, sq, moving):
+            v = VAL[p & 7]
+            if v > best:
+                best = v
+    board[fr] = moving
+    board[to] = cap
+    return best
+
+
+def _chou_setup(ksq, side):
+    """Small bonus for a battery that can uncover check on the enemy king."""
+    if ksq < 0:
+        return 0
+    board = BOARD
+    bonus = 0
+    for sq in PL[side >> 3]:
+        p = board[sq]
+        if not p or (p & 8) != side:
+            continue
+        t = p & 7
+        if t != R and t != C:
+            continue
+        step = _step(sq, ksq)
+        if not step:
+            continue
+        occ = 0
+        ours = 0
+        s = sq + step
+        while s != ksq:
+            p2 = board[s]
+            if p2:
+                occ += 1
+                if (p2 & 8) == side:
+                    ours += 1
+                if occ > 2:
+                    break
+            s += step
+        if t == R and occ == 1 and ours == 1:
+            bonus += CHOU_SETUP
+        elif t == C and occ == 2 and ours:
+            bonus += CHOU_SETUP
+    ht = side + H
+    for hsq, leg in HORSE_FROM[ksq]:
+        if board[hsq] == ht and board[leg] and (board[leg] & 8) == side:
+            bonus += CHOU_SETUP
+    return bonus
+
+
 def _eye(ksq, cannon):
     if ksq < 0:
         return 0
@@ -689,6 +977,8 @@ def evaluate(side):
             score += _eye(kb, RED + C) * eb
         if kr >= 0:
             score -= _eye(kr, BLACK + C) * eb
+    score += _chou_setup(kb, RED)
+    score -= _chou_setup(kr, BLACK)
     if side:
         return -score
     return score
@@ -704,18 +994,28 @@ def order_moves(moves, side, ply, tt_mv, prev_best=0):
         k1 = KILL[ply][1]
     pr = PST_R
     pb = PST_B
+    blockers = set(_discover_squares(side))
     scored = []
     append = scored.append
     for mv in moves:
         cap = mv >> 14
+        chou = _chou_target(mv, side, blockers) if blockers else 0
         if cap and (cap & 7) == K:
             s = 5000000
         elif mv == prev_best and prev_best:
             s = 4000000
         elif mv == tt_mv and tt_mv:
             s = 3500000
+        elif chou:
+            # Uncover check and take (or attack) another piece.
+            s = 2800000 + chou
         elif cap:
-            s = 1000000 + (VAL[cap & 7] << 4) - VAL[board[mv & 127] & 7]
+            gain = see_gain(mv)
+            if gain >= 0:
+                s = 1200000 + gain
+            else:
+                # Recapture wins the exchange: try this after real moves.
+                s = 250000 + gain
         elif mv == k0:
             s = 900000
         elif mv == k1:
@@ -793,18 +1093,26 @@ def qsearch(alpha, beta, side, ply, nocap, qdepth):
             alpha = stand
         if qdepth <= 0:
             return stand
-        moves = [mv for mv in gen_pseudo(side) if mv >> 14]
+        # Captures, plus quiet moves that step off a battery. 抽将 is often
+        # quiet on this ply and only takes the piece after the check is answered.
+        blocks = set(_discover_squares(side))
+        moves = []
+        for mv in gen_pseudo(side):
+            if (mv >> 14) or (blocks and (mv & 127) in blocks):
+                moves.append(mv)
         if not moves:
             return stand
     ordered = order_moves(moves, side, ply, 0)
     opp = side ^ 8
     legal_any = False
     best = -INF if checked else alpha
-    for _, mv in ordered:
+    for s, mv in ordered:
         cap = mv >> 14
+        if not checked and s < 500000:
+            break
         if not checked and cap and (cap & 7) != K:
             if stand + VAL[cap & 7] + 200 < alpha:
-                break
+                continue
         if not is_legal(mv, side, checked, ksq):
             continue
         legal_any = True
@@ -1007,7 +1315,10 @@ def _branch_factor(npieces, nlegal, prev_dur, older_dur):
     the same budget is allowed to start (and often finish) extra plies.
     """
     if npieces >= 28:
-        guess = 2.15
+        # Capture safety and 抽将 make each node heavier, so a full board
+        # grows faster than 2x. 1.6 still spends the rest of the budget
+        # on the next ply instead of returning early.
+        guess = 1.6
     elif npieces >= 20:
         guess = 2.1
     elif npieces >= 14:
