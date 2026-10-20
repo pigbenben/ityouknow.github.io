@@ -751,8 +751,12 @@ def see_gain(mv):
     return victim - attacker + back
 
 
-def _best_capture_gain(side):
-    """Best material `side` can win at once. A king capture is mate."""
+def _best_capture_gain(side, skip_sq=-1):
+    """Best material `side` can win at once. A king capture is mate.
+
+    Captures landing on `skip_sq` are ignored. That square is the piece we
+    just traded, whose recapture is already priced into the exchange.
+    """
     ksq = KR[side >> 3]
     if ksq < 0:
         return 0
@@ -760,7 +764,9 @@ def _best_capture_gain(side):
     best = 0
     for mv in gen_pseudo(side):
         cap = mv >> 14
-        if not cap or not is_legal(mv, side, checked, ksq):
+        if not cap or ((mv >> 7) & 127) == skip_sq:
+            continue
+        if not is_legal(mv, side, checked, ksq):
             continue
         if (cap & 7) == K:
             return MATE
@@ -801,56 +807,38 @@ def _loose_camp_penalty(side):
                 continue
         elif y < 5:
             continue
-        if _least_attacker(sq, side) is None:
+        # Attacked pieces are a capture the search can see. Only a major that
+        # nobody attacks yet, and that we do not defend, is quietly lost.
+        if _least_attacker(sq, side) is None and _least_attacker(sq, side ^ 8) is None:
             pen += LOOSE_CAMP
     return pen
 
 
-def _delivers_mate(mv, side):
-    """True when this move checks and the opponent has no legal reply."""
-    info = make(mv)
-    opp = side ^ 8
-    ksq = KR[opp >> 3]
-    mate = ksq >= 0 and in_check(opp, ksq) and not gen_legal(opp)
-    unmake(*info)
-    return mate
+def _move_loss(mv, side):
+    """Material this move concedes above a fair exchange. 0 keeps the piece.
 
-
-def _move_drops_piece(mv, side):
-    """True when this move hands the opponent a piece we do not win back.
-
-    A capture that is recaptured for a loss counts. So does any move that
-    leaves the opponent a profitable capture of a non-pawn, a cannon trip
-    while both horses are still home, or parking a major across the river
-    with nothing protecting it just to take a pawn. Mate is kept.
+    The recapture of a piece we just captured is not counted twice. A threat
+    that is still there after the move is. Mate is 0 so it is always kept.
     """
     cap = mv >> 14
     if cap and (cap & 7) == K:
-        return False
+        return 0
     gained = see_gain(mv) if cap else 0
-    if cap and gained < 0:
-        return not _delivers_mate(mv, side)
-    moving = BOARD[mv & 127]
-    cannon_early = (
-        _horses_home(side)
-        and moving
-        and (moving & 7) == C
-        and not (cap and VAL[cap & 7] >= 140 and gained >= 0)
-    )
+    to = (mv >> 7) & 127
     info = make(mv)
-    their = _best_capture_gain(side ^ 8)
-    loose = _loose_camp_penalty(side)
+    opp = side ^ 8
+    ksq = KR[opp >> 3]
+    if ksq >= 0 and in_check(opp, ksq) and not gen_legal(opp):
+        unmake(*info)
+        return 0
+    their = _best_capture_gain(opp, to if cap else -1)
+    loose = _loose_camp_penalty(side) if gained < 140 else 0
     unmake(*info)
-    # Advisor, elephant, horse, cannon, rook. Not a pawn.
-    bad = their >= 140 and their > gained + 30
-    # A pawn is not worth an undefended major in the enemy camp.
-    if loose and gained < 140:
-        bad = True
-    if cannon_early:
-        bad = True
-    if bad and _delivers_mate(mv, side):
-        return False
-    return bad
+    loss = -gained if gained < 0 else 0
+    if their >= 140:
+        loss += max(0, their - max(gained, 0))
+    loss += loose
+    return loss
 
 
 def _discover_squares(side):
@@ -1513,12 +1501,33 @@ def search_root(side, max_depth, time_limit, root_nocap, npieces=32):
         if cap and (cap & 7) == K:
             LAST = (0, 1, MATE, 0.0)
             return mv
-    # Drop moves that hand the opponent a piece, when any move does not.
-    # Search then attacks only among the moves that survive the exchange.
-    safe = []
-    for mv in legal:
-        if not _move_drops_piece(mv, side):
-            safe.append(mv)
+    # Keep the moves that concede the least. When a rook or horse is already
+    # hanging, only the moves that save it (or lose no more than that) are
+    # searched. If every move loses a piece, the ones that lose the least stay.
+    ranked = [(_move_loss(mv, side), mv) for mv in legal]
+    best_loss = ranked[0][0]
+    for loss, _mv in ranked:
+        if loss < best_loss:
+            best_loss = loss
+    # A few points of exchange noise stay in the list: the strictly cheapest
+    # move can be the one that walks into mate, and the search has to see both.
+    if best_loss < 140:
+        limit = best_loss + 40
+    else:
+        limit = best_loss + 30
+    safe = [mv for loss, mv in ranked if loss <= limit]
+    if _horses_home(side):
+        others = []
+        for mv in safe:
+            moving = BOARD[mv & 127]
+            cap = mv >> 14
+            if (moving & 7) == C and not (
+                cap and VAL[cap & 7] >= 140 and see_gain(mv) >= 0
+            ):
+                continue
+            others.append(mv)
+        if others:
+            safe = others
     if safe:
         legal = safe
     nlegal = len(legal)
