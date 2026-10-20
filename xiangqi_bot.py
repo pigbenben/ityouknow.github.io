@@ -20,6 +20,9 @@ INF = 10 ** 9
 TIME_BUDGET = 0.85
 DRAW_PLIES = 200  # 100 rounds without a capture
 CHOU_SETUP = 18  # battery that can uncover a check (抽将)
+# Undefended rook, horse, or cannon across the river. Larger than a pawn
+# (even with its positional bonus) and smaller than winning a horse.
+LOOSE_CAMP = 240
 
 SQX = [i % 9 for i in range(90)]
 SQY = [i // 9 for i in range(90)]
@@ -748,6 +751,108 @@ def see_gain(mv):
     return victim - attacker + back
 
 
+def _best_capture_gain(side):
+    """Best material `side` can win at once. A king capture is mate."""
+    ksq = KR[side >> 3]
+    if ksq < 0:
+        return 0
+    checked = in_check(side, ksq)
+    best = 0
+    for mv in gen_pseudo(side):
+        cap = mv >> 14
+        if not cap or not is_legal(mv, side, checked, ksq):
+            continue
+        if (cap & 7) == K:
+            return MATE
+        gain = see_gain(mv)
+        if gain > best:
+            best = gain
+    return best
+
+
+def _horses_home(side):
+    """Both horses still on their original squares."""
+    board = BOARD
+    if side == RED:
+        return board[82] == RED + H and board[88] == RED + H
+    return board[1] == BLACK + H and board[7] == BLACK + H
+
+
+def _loose_camp_penalty(side):
+    """Penalty for an undefended rook, horse, or cannon across the river.
+
+    A major that has crossed and is not attacked by one of our own pieces can
+    be surrounded before the rest of the army moves. The charge is applied to
+    whoever owns the piece, so capturing it still gains the material.
+    """
+    board = BOARD
+    pen = 0
+    red = side == RED
+    for sq in PL[side >> 3]:
+        p = board[sq]
+        if not p or (p & 8) != side:
+            continue
+        t = p & 7
+        if t != H and t != R and t != C:
+            continue
+        y = SQY[sq]
+        if red:
+            if y > 4:
+                continue
+        elif y < 5:
+            continue
+        if _least_attacker(sq, side) is None:
+            pen += LOOSE_CAMP
+    return pen
+
+
+def _delivers_mate(mv, side):
+    """True when this move checks and the opponent has no legal reply."""
+    info = make(mv)
+    opp = side ^ 8
+    ksq = KR[opp >> 3]
+    mate = ksq >= 0 and in_check(opp, ksq) and not gen_legal(opp)
+    unmake(*info)
+    return mate
+
+
+def _move_drops_piece(mv, side):
+    """True when this move hands the opponent a piece we do not win back.
+
+    A capture that is recaptured for a loss counts. So does any move that
+    leaves the opponent a profitable capture of a non-pawn, a cannon trip
+    while both horses are still home, or parking a major across the river
+    with nothing protecting it just to take a pawn. Mate is kept.
+    """
+    cap = mv >> 14
+    if cap and (cap & 7) == K:
+        return False
+    gained = see_gain(mv) if cap else 0
+    if cap and gained < 0:
+        return not _delivers_mate(mv, side)
+    moving = BOARD[mv & 127]
+    cannon_early = (
+        _horses_home(side)
+        and moving
+        and (moving & 7) == C
+        and not (cap and VAL[cap & 7] >= 140 and gained >= 0)
+    )
+    info = make(mv)
+    their = _best_capture_gain(side ^ 8)
+    loose = _loose_camp_penalty(side)
+    unmake(*info)
+    # Advisor, elephant, horse, cannon, rook. Not a pawn.
+    bad = their >= 140 and their > gained + 30
+    # A pawn is not worth an undefended major in the enemy camp.
+    if loose and gained < 140:
+        bad = True
+    if cannon_early:
+        bad = True
+    if bad and _delivers_mate(mv, side):
+        return False
+    return bad
+
+
 def _discover_squares(side):
     """Squares our pieces stand on where leaving reveals a check."""
     ksq = KR[(side ^ 8) >> 3]
@@ -915,6 +1020,33 @@ def _chou_setup(ksq, side):
     return bonus
 
 
+def _early_cannon(side):
+    """Penalty for moving a cannon before either horse has left home.
+
+    Both cannons start on their own pawn line. Leaving that square while both
+    horses are still on the back rank is what lets the opponent take the
+    cannons before the rest of the army has moved.
+    """
+    board = BOARD
+    if side == RED:
+        if board[82] != RED + H or board[88] != RED + H:
+            return 0
+        home = (64, 70)  # (1,7), (7,7)
+        pl = PL[0]
+        cannon = RED + C
+    else:
+        if board[1] != BLACK + H or board[7] != BLACK + H:
+            return 0
+        home = (19, 25)  # (1,2), (7,2)
+        pl = PL[1]
+        cannon = BLACK + C
+    out = 0
+    for sq in pl:
+        if board[sq] == cannon and sq not in home:
+            out += 140
+    return out
+
+
 def _eye(ksq, cannon):
     if ksq < 0:
         return 0
@@ -1001,6 +1133,10 @@ def evaluate(side):
             score -= _eye(kr, BLACK + C) * eb
     score += _chou_setup(kb, RED)
     score -= _chou_setup(kr, BLACK)
+    score -= _early_cannon(RED)
+    score += _early_cannon(BLACK)
+    score -= _loose_camp_penalty(RED)
+    score += _loose_camp_penalty(BLACK)
     if side:
         return -score
     return score
@@ -1377,6 +1513,14 @@ def search_root(side, max_depth, time_limit, root_nocap, npieces=32):
         if cap and (cap & 7) == K:
             LAST = (0, 1, MATE, 0.0)
             return mv
+    # Drop moves that hand the opponent a piece, when any move does not.
+    # Search then attacks only among the moves that survive the exchange.
+    safe = []
+    for mv in legal:
+        if not _move_drops_piece(mv, side):
+            safe.append(mv)
+    if safe:
+        legal = safe
     nlegal = len(legal)
     if nlegal == 1 or max_depth == 0:
         LAST = (0, 1, 0, 0.0)
