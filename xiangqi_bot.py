@@ -346,7 +346,7 @@ def pieces_key(pieces):
     return tuple(b)
 
 
-INITIAL_KEY = pieces_key([
+_START_PIECES = [
     {"x": 0, "y": 0, "c": "b", "t": "R"}, {"x": 1, "y": 0, "c": "b", "t": "H"},
     {"x": 2, "y": 0, "c": "b", "t": "E"}, {"x": 3, "y": 0, "c": "b", "t": "A"},
     {"x": 4, "y": 0, "c": "b", "t": "K"}, {"x": 5, "y": 0, "c": "b", "t": "A"},
@@ -363,7 +363,29 @@ INITIAL_KEY = pieces_key([
     {"x": 3, "y": 9, "c": "r", "t": "A"}, {"x": 4, "y": 9, "c": "r", "t": "K"},
     {"x": 5, "y": 9, "c": "r", "t": "A"}, {"x": 6, "y": 9, "c": "r", "t": "E"},
     {"x": 7, "y": 9, "c": "r", "t": "H"}, {"x": 8, "y": 9, "c": "r", "t": "R"},
-])
+]
+INITIAL_KEY = pieces_key(_START_PIECES)
+
+# First-move choices. Red and Black each draw one at random so the opening
+# is not the same every game. Later moves still come from the search.
+_RED_OPENING = (
+    (1, 7, 4, 7), (7, 7, 4, 7),  # 当头炮
+    (1, 7, 3, 7), (7, 7, 5, 7),  # 仕角炮
+    (2, 6, 2, 5), (6, 6, 6, 5),  # 仙人指路
+    (4, 6, 4, 5),                # 中兵
+    (1, 9, 2, 7),                # 马八进七
+    (2, 9, 4, 7), (6, 9, 4, 7),  # 飞相
+)
+_BLACK_OPENING = (
+    (1, 2, 4, 2), (7, 2, 4, 2),  # 当头炮
+    (1, 2, 3, 2), (7, 2, 5, 2),  # 仕角炮
+    (2, 3, 2, 4), (6, 3, 6, 4),  # 进卒
+    (4, 3, 4, 4),                # 中卒
+    (1, 0, 2, 2), (7, 0, 6, 2),  # 屏风马
+    (2, 0, 4, 2), (6, 0, 4, 2),  # 飞象
+)
+_OPENING_BOOK = None
+_opening_rng = random.SystemRandom()
 
 
 def make(mv):
@@ -1394,6 +1416,53 @@ def search_root(side, max_depth, time_limit, root_nocap, npieces=32):
     return best
 
 
+def _shifted(pieces, mv):
+    fx, fy, tx, ty = mv
+    out = []
+    for pc in pieces:
+        if (pc["x"], pc["y"]) == (tx, ty):
+            continue
+        if (pc["x"], pc["y"]) == (fx, fy):
+            out.append({"x": tx, "y": ty, "c": pc["c"], "t": pc["t"]})
+        else:
+            out.append(pc)
+    return out
+
+
+def _build_opening_book():
+    """Map the start, and every position after one red move, to opening choices."""
+    book = {INITIAL_KEY: _RED_OPENING}
+    load(_START_PIECES, RED)
+    for mv in gen_legal(RED):
+        fr = mv & 127
+        to = (mv >> 7) & 127
+        coord = (SQX[fr], SQY[fr], SQX[to], SQY[to])
+        book[pieces_key(_shifted(_START_PIECES, coord))] = _BLACK_OPENING
+    return book
+
+
+def _opening_move(side):
+    """Random legal choice from the opening list, or None to search."""
+    global LAST
+    options = _OPENING_BOOK.get(board_key())
+    if not options:
+        return None
+    ksq = KR[side >> 3]
+    checked = in_check(side, ksq)
+    legal = {}
+    for mv in gen_pseudo(side):
+        if not is_legal(mv, side, checked, ksq):
+            continue
+        fr = mv & 127
+        to = (mv >> 7) & 127
+        legal[(SQX[fr], SQY[fr], SQX[to], SQY[to])] = mv
+    choices = [legal[c] for c in options if c in legal]
+    if not choices:
+        return None
+    LAST = (0, 0, 0, 0.0)
+    return _opening_rng.choice(choices)
+
+
 def think(pieces, turn, mem, weights, depth=None, time_limit=None):
     """Search and return (fx, fy, tx, ty) or None. Updates mem history."""
     _bind(mem)
@@ -1417,7 +1486,9 @@ def think(pieces, turn, mem, weights, depth=None, time_limit=None):
     h = HASH
     GH[h] = GH.get(h, 0) + 1
     limit = TIME_BUDGET if time_limit is None else time_limit
-    mv = search_root(side, depth, limit, root_nocap, n)
+    mv = _opening_move(side)
+    if mv is None:
+        mv = search_root(side, depth, limit, root_nocap, n)
     if mv is None:
         mem.snapshot = None
         mem.last_n = n
@@ -1501,3 +1572,6 @@ def move(pieces, turn):
         fr = mv & 127
         to = (mv >> 7) & 127
         return (SQX[fr], SQY[fr], SQX[to], SQY[to])
+
+
+_OPENING_BOOK = _build_opening_book()
