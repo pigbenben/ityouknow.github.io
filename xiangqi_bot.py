@@ -751,7 +751,7 @@ def see_gain(mv):
     return victim - attacker + back
 
 
-def _best_capture_gain(side, skip_sq=-1):
+def _best_capture_gain(side, skip_sq=-1, skip_pawns=False):
     """Best material `side` can win at once. A king capture is mate.
 
     Captures landing on `skip_sq` are ignored. That square is the piece we
@@ -765,6 +765,8 @@ def _best_capture_gain(side, skip_sq=-1):
     for mv in gen_pseudo(side):
         cap = mv >> 14
         if not cap or ((mv >> 7) & 127) == skip_sq:
+            continue
+        if skip_pawns and (cap & 7) == P:
             continue
         if not is_legal(mv, side, checked, ksq):
             continue
@@ -814,6 +816,39 @@ def _loose_camp_penalty(side):
     return pen
 
 
+def _exposed_gain(opp, skip_sq=-1):
+    """Best exchange `opp` can win by taking one of our non-pawns.
+
+    Legality of pins is not checked. A square we just captured on is skipped
+    because that recapture is already in the exchange value.
+    """
+    board = BOARD
+    side = opp ^ 8
+    ksq = KR[side >> 3]
+    if ksq >= 0 and in_check(side, ksq):
+        mate = _best_capture_gain(opp, skip_sq, skip_pawns=True)
+        if mate >= MATE_TH:
+            return mate
+    best = 0
+    for sq in PL[side >> 3]:
+        if sq == skip_sq:
+            continue
+        vic = board[sq]
+        if not vic or (vic & 8) != side:
+            continue
+        vt = vic & 7
+        if vt == P or vt == K:
+            continue
+        for fr in PL[opp >> 3]:
+            p = board[fr]
+            if not p or (p & 8) != opp or not _piece_attacks(fr, sq, p):
+                continue
+            g = see_gain(fr | (sq << 7) | (vic << 14))
+            if g > best:
+                best = g
+    return best
+
+
 def _move_loss(mv, side):
     """Material this move concedes above a fair exchange. 0 keeps the piece.
 
@@ -831,11 +866,14 @@ def _move_loss(mv, side):
     if ksq >= 0 and in_check(opp, ksq) and not gen_legal(opp):
         unmake(*info)
         return 0
-    their = _best_capture_gain(opp, to if cap else -1)
+    their = _exposed_gain(opp, to if cap else -1)
     loose = _loose_camp_penalty(side) if gained < 140 else 0
     unmake(*info)
     loss = -gained if gained < 0 else 0
-    if their >= 140:
+    # Any non-pawn the opponent wins, including cannon-for-horse, counts.
+    # A hanging pawn does not: forcing the only pawn-saving move walked into
+    # mate and gave away the major pieces.
+    if their > 0:
         loss += max(0, their - max(gained, 0))
     loss += loose
     return loss
@@ -1035,6 +1073,44 @@ def _early_cannon(side):
     return out
 
 
+def _shape_penalty(side):
+    """Penalty for an early king walk, minus a horse attack on the enemy king.
+
+    Walking the king out while most pieces are still on the board was the
+    start of the short mates. A horse hitting the enemy king is the attack
+    that replaces those king moves.
+    """
+    board = BOARD
+    ksq = KR[side >> 3]
+    if ksq < 0:
+        return 0
+    opp = side ^ 8
+    pen = 0
+    bonus = 0
+    many = len(PL[0]) + len(PL[1]) >= 16
+    if many and ((side == RED and ksq != 85) or (side == BLACK and ksq != 4)):
+        # Stepping the king out of the palace corner before pieces are traded
+        # is how the short mates started.
+        pen += 180
+    ht = opp + H
+    for hsq, leg in HORSE_FROM[ksq]:
+        if board[hsq] == ht and board[leg] == 0:
+            pen += 100
+    file = SQX[ksq]
+    for y in range(10):
+        p = board[y * 9 + file]
+        if p and (p & 8) == opp and ((p & 7) == R or (p & 7) == C):
+            pen += 36
+            break
+    eksq = KR[opp >> 3]
+    if eksq >= 0:
+        my_h = side + H
+        for hsq, leg in HORSE_FROM[eksq]:
+            if board[hsq] == my_h and board[leg] == 0:
+                bonus += 48
+    return pen - bonus
+
+
 def _eye(ksq, cannon):
     if ksq < 0:
         return 0
@@ -1125,6 +1201,8 @@ def evaluate(side):
     score += _early_cannon(BLACK)
     score -= _loose_camp_penalty(RED)
     score += _loose_camp_penalty(BLACK)
+    score -= _shape_penalty(RED)
+    score += _shape_penalty(BLACK)
     if side:
         return -score
     return score
@@ -1461,10 +1539,10 @@ def _branch_factor(npieces, nlegal, prev_dur, older_dur):
     the same budget is allowed to start (and often finish) extra plies.
     """
     if npieces >= 28:
-        # Capture safety and 抽将 make each node heavier, so a full board
-        # grows faster than 2x. 1.6 still spends the rest of the budget
-        # on the next ply instead of returning early.
-        guess = 1.6
+        # King safety and hanging-piece checks make a node heavier. Stay
+        # close to 1x so the rest of the budget is spent on the next ply;
+        # the deadline aborts that ply if it runs long.
+        guess = 1.15
     elif npieces >= 20:
         guess = 2.1
     elif npieces >= 14:
@@ -1484,9 +1562,31 @@ def _branch_factor(npieces, nlegal, prev_dur, older_dur):
     return guess
 
 
+def _deeper_ply(npieces, nlegal, prev_dur, older_dur):
+    """Start another ply when the clock can still finish a root move.
+
+    Predicting the whole ply and then refusing to start it left a third of
+    the budget unused, which is where the shallow mates came from. The
+    deadline aborts a ply that runs long; a root move that did finish replaces
+    the previous choice.
+    """
+    remain = DEADLINE - time.perf_counter()
+    if remain < 0.05:
+        return False
+    if prev_dur <= 0:
+        return True
+    factor = _branch_factor(npieces, nlegal, prev_dur, older_dur)
+    # One root move is a fraction of the previous ply. Skip only when even
+    # that slice cannot fit, so the abort would return the same move.
+    return prev_dur * factor <= remain * max(6, nlegal)
+
+
 def search_root(side, max_depth, time_limit, root_nocap, npieces=32):
     global ABORT, DEADLINE, NODES, LAST, PATH
     PATH.clear()
+    # The exchange filter runs inside the same budget as the search.
+    DEADLINE = time.perf_counter() + time_limit
+    ABORT = False
     ksq = KR[side >> 3]
     checked = in_check(side, ksq)
     legal = []
@@ -1496,6 +1596,7 @@ def search_root(side, max_depth, time_limit, root_nocap, npieces=32):
     if not legal:
         LAST = (0, 0, 0, 0.0)
         return None
+    n_all = len(legal)
     for mv in legal:
         cap = mv >> 14
         if cap and (cap & 7) == K:
@@ -1509,13 +1610,16 @@ def search_root(side, max_depth, time_limit, root_nocap, npieces=32):
     for loss, _mv in ranked:
         if loss < best_loss:
             best_loss = loss
-    # A few points of exchange noise stay in the list: the strictly cheapest
-    # move can be the one that walks into mate, and the search has to see both.
+    # Keep the moves that concede the least. A losing exchange is not kept
+    # alongside a move that concedes nothing: those were the cannon-for-horse
+    # trades. If every such move is later scored as a mate, the wider set is
+    # searched with whatever time is left.
     if best_loss < 140:
-        limit = best_loss + 40
+        limit = best_loss
     else:
         limit = best_loss + 30
     safe = [mv for loss, mv in ranked if loss <= limit]
+    wider = [mv for loss, mv in ranked if loss <= best_loss + 80]
     if _horses_home(side):
         others = []
         for mv in safe:
@@ -1528,15 +1632,23 @@ def search_root(side, max_depth, time_limit, root_nocap, npieces=32):
             others.append(mv)
         if others:
             safe = others
+    # Stepping the king while the board is still full was how the short mates
+    # began. A king capture is kept; a quiet king step is not, when any other
+    # move concedes no more.
+    if not checked and npieces >= 20:
+        others = [mv for mv in safe if (BOARD[mv & 127] & 7) != K or (mv >> 14)]
+        if others:
+            safe = others
     if safe:
         legal = safe
     nlegal = len(legal)
-    if nlegal == 1 or max_depth == 0:
+    # One legal move can be played at once. One move left by the filter still
+    # has to be searched: its score is what opens the wider set when that
+    # "safe" move is mate.
+    if (nlegal == 1 and n_all == 1) or max_depth == 0:
         LAST = (0, 1, 0, 0.0)
         return legal[0]
 
-    DEADLINE = time.perf_counter() + time_limit
-    ABORT = False
     NODES = 0
     best = legal[0]
     best_score = -INF
@@ -1547,10 +1659,8 @@ def search_root(side, max_depth, time_limit, root_nocap, npieces=32):
     limit = max_depth if max_depth else 32
     d = 1
     while d <= limit:
-        if d > 1:
-            factor = _branch_factor(npieces, nlegal, prev_dur, older_dur)
-            if time.perf_counter() + prev_dur * factor > DEADLINE:
-                break
+        if d > 1 and not _deeper_ply(npieces, nlegal, prev_dur, older_dur):
+            break
         ABORT = False
         st = time.perf_counter()
         sc, mv, done = _root_depth(side, legal, d, best, root_nocap)
@@ -1565,6 +1675,42 @@ def search_root(side, max_depth, time_limit, root_nocap, npieces=32):
         if sc > MATE - 800:
             break
         d += 1
+    if (
+        best_score < -(MATE - 800)
+        and len(wider) > len(legal)
+        and time.perf_counter() < DEADLINE
+    ):
+        # Every cheap move is mate. Look at the next band of exchanges.
+        legal = wider
+        nlegal = len(legal)
+        rescue_best = best
+        rescue_score = best_score
+        best = legal[0]
+        best_score = -INF
+        prev_dur = 0.0
+        older_dur = 0.0
+        depth_done = 0
+        d = 1
+        while d <= limit:
+            if d > 1 and not _deeper_ply(npieces, nlegal, prev_dur, older_dur):
+                break
+            ABORT = False
+            st = time.perf_counter()
+            sc, mv, done = _root_depth(side, legal, d, best, root_nocap)
+            older_dur = prev_dur
+            prev_dur = time.perf_counter() - st
+            if mv is not None:
+                best = mv
+                best_score = sc
+            if not done:
+                break
+            depth_done = d
+            if sc > MATE - 800:
+                break
+            d += 1
+        if best_score <= rescue_score:
+            best = rescue_best
+            best_score = rescue_score
     LAST = (depth_done, NODES, best_score, time.perf_counter() - t0)
     return best
 
