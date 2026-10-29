@@ -1,5 +1,7 @@
 package com.ticket.searchxml.response;
 
+import java.util.List;
+
 import lombok.Getter;
 import lombok.Setter;
 
@@ -12,10 +14,10 @@ import lombok.Setter;
 public class Traveller {
 
     /**
-     * 常旅客信息。
-     * <p>类型：fQTV；约束：O（可选）；基数：0-1。</p>
+     * 常旅客信息列表。
+     * <p>类型：fQTV；约束：O（可选）；基数：0-N（List）。subfQTV 的属性已上收到 FQTV。</p>
      */
-    private FQTV fQTV;
+    private List<FQTV> fQTV;
 
     /**
      * 名。

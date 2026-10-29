@@ -1,5 +1,7 @@
 package com.ticket.searchxml.response;
 
+import java.util.List;
+
 import lombok.Getter;
 import lombok.Setter;
 
@@ -18,10 +20,10 @@ public class Payments {
     private FormOfPayment formOfPayment;
 
     /**
-     * 支付明细。
-     * <p>类型：payment；约束：M（必填）；基数：1。</p>
+     * 支付明细列表。
+     * <p>类型：payment；约束：M（必填）；基数：1-N（List）。subpayment 的属性已上收到 Payment。</p>
      */
-    private Payment payment;
+    private List<Payment> payment;
 
     /**
      * 出示信用卡标识。

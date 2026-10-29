@@ -1,5 +1,7 @@
 package com.ticket.searchxml.response;
 
+import java.util.List;
+
 import lombok.Getter;
 import lombok.Setter;
 
@@ -18,10 +20,10 @@ public class Result {
     private ErrorInfo errorInfo;
 
     /**
-     * 客票信息。
-     * <p>类型：ticketInfo；约束：O（可选）；基数：0-1。</p>
+     * 客票信息列表。
+     * <p>类型：ticketInfo；约束：O（可选）；基数：0-N（List）。subticketInfo 的属性已上收到 TicketInfo。</p>
      */
-    private TicketInfo ticketInfo;
+    private List<TicketInfo> ticketInfo;
 
     /**
      * 电子客票备注信息。

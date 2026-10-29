@@ -1,5 +1,7 @@
 package com.ticket.searchxml.response;
 
+import java.util.List;
+
 import lombok.Getter;
 import lombok.Setter;
 
@@ -18,10 +20,10 @@ public class Taxes {
     private String currency;
 
     /**
-     * 税项。
-     * <p>类型：tax；约束：M（必填）；基数：1。</p>
+     * 税项列表。
+     * <p>类型：tax；约束：M（必填）；基数：1-N（List）。subtax 的属性已上收到 Tax。</p>
      */
-    private Tax tax;
+    private List<Tax> tax;
 
     /**
      * 税项总和。
